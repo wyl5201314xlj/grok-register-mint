@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python
+#!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
 Grok 注册机 - TTK GUI 版本
@@ -1699,8 +1699,72 @@ def get_email_provider():
     return config.get("email_provider", "duckmail")
 
 
+def kiro_get_email_and_token(api_key=None):
+    api_base = str(config.get("kiro_api_base") or config.get("cloudflare_api_base") or "https://kiro-mail-worker.wyf886.workers.dev").rstrip("/")
+    key = str(api_key or config.get("kiro_api_key") or config.get("cloudflare_api_key") or "km_3gzyd9h2m56u8a1vtixjrewol0knpbc74qsf")
+    domain = str(config.get("defaultDomains") or "123458.online").split(",")[0].strip()
+    headers = {"X-API-Key": key, "Content-Type": "application/json"}
+    resp = http_post(f"{api_base}/api/emails/generate", json={"domain": domain}, headers=headers)
+    resp.raise_for_status()
+    data = resp.json()
+    address = data.get("address") or data.get("email")
+    mailbox_id = data.get("id")
+    if not address or not mailbox_id:
+        raise Exception(f"邮件 Worker 创建邮箱失败: {resp.text}")
+    return address, mailbox_id
+
+
+def kiro_get_oai_code(mailbox_id, email, timeout=180, poll_interval=3, log_callback=None, cancel_callback=None, resend_callback=None):
+    api_base = str(config.get("kiro_api_base") or config.get("cloudflare_api_base") or "https://kiro-mail-worker.wyf886.workers.dev").rstrip("/")
+    key = str(config.get("kiro_api_key") or config.get("cloudflare_api_key") or "km_3gzyd9h2m56u8a1vtixjrewol0knpbc74qsf")
+    headers = {"X-API-Key": key}
+    deadline = time.time() + timeout
+    seen_ids = set()
+    next_resend_at = time.time() + 35
+    while time.time() < deadline:
+        raise_if_cancelled(cancel_callback)
+        if resend_callback and time.time() >= next_resend_at:
+            try:
+                resend_callback()
+                if log_callback:
+                    log_callback("[*] 已触发重新发送验证码")
+            except Exception:
+                pass
+            next_resend_at = time.time() + 35
+        try:
+            resp = http_get(f"{api_base}/api/emails/{mailbox_id}", headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                messages = data.get("messages") or []
+                for msg in messages:
+                    msg_id = msg.get("id")
+                    if not msg_id or msg_id in seen_ids:
+                        continue
+                    seen_ids.add(msg_id)
+                    subj = str(msg.get("subject") or "")
+                    content = str(msg.get("content") or "") + " " + str(msg.get("html") or "")
+                    if log_callback:
+                        log_callback(f"[Debug] 收到邮件: {subj}")
+                    code = extract_verification_code(content, subj)
+                    if code:
+                        if log_callback:
+                            log_callback(f"[*] 从邮件中提取到验证码: {code}")
+                        return code
+        except Exception as e:
+            if log_callback:
+                log_callback(f"[Debug] 轮询邮件异常: {e}")
+        sleep_with_cancel(poll_interval, cancel_callback)
+    raise Exception(f"在 {timeout}s 内未收到验证码邮件")
+
+
 def get_email_and_token(api_key=None):
     provider = get_email_provider()
+    if provider in ("kiro", "cloudflare_worker", "worker", "cloudflare"):
+        try:
+            return kiro_get_email_and_token(api_key=api_key)
+        except Exception as e:
+            if provider != "cloudflare":
+                raise
     if provider == "yyds":
         return yyds_get_email_and_token(api_key=api_key, jwt=get_yyds_jwt())
     if provider == "cloudflare":
@@ -1739,7 +1803,7 @@ def get_email_and_token(api_key=None):
     create_account(address, password, api_key=key, expires_in=0)
     token = get_token(address, password)
     if not token:
-        raise Exception("鑾峰彇 DuckMail token 澶辫触")
+        raise Exception("获取 DuckMail token 失败")
     return address, token
 
 
@@ -1753,6 +1817,16 @@ def get_oai_code(
     resend_callback=None,
 ):
     provider = get_email_provider()
+    if provider in ("kiro", "cloudflare_worker", "worker"):
+        return kiro_get_oai_code(
+            dev_token,
+            email,
+            timeout=timeout,
+            poll_interval=poll_interval,
+            log_callback=log_callback,
+            cancel_callback=cancel_callback,
+            resend_callback=resend_callback,
+        )
     if provider == "yyds":
         return yyds_get_oai_code(
             dev_token,
@@ -1764,15 +1838,26 @@ def get_oai_code(
             cancel_callback=cancel_callback,
         )
     if provider == "cloudflare":
-        return cloudflare_get_oai_code(
-            dev_token,
-            email,
-            timeout=timeout,
-            poll_interval=poll_interval,
-            log_callback=log_callback,
-            cancel_callback=cancel_callback,
-            resend_callback=resend_callback,
-        )
+        try:
+            return kiro_get_oai_code(
+                dev_token,
+                email,
+                timeout=timeout,
+                poll_interval=poll_interval,
+                log_callback=log_callback,
+                cancel_callback=cancel_callback,
+                resend_callback=resend_callback,
+            )
+        except Exception:
+            return cloudflare_get_oai_code(
+                dev_token,
+                email,
+                timeout=timeout,
+                poll_interval=poll_interval,
+                log_callback=log_callback,
+                cancel_callback=cancel_callback,
+                resend_callback=resend_callback,
+            )
     return duckmail_get_oai_code(
         dev_token,
         email,
@@ -3038,7 +3123,10 @@ const lower = compact.toLowerCase();
 if (
   (compact.includes('已被拒绝') && (compact.includes('邮箱域名') || compact.includes('域名'))) ||
   (lower.includes('rejected') && (lower.includes('email') || lower.includes('domain'))) ||
-  lower.includes('email domain') && lower.includes('not allowed')
+  lower.includes('email domain') && lower.includes('not allowed') ||
+  lower.includes('your email address is invalid') ||
+  lower.includes('email sign-up isn’t available') ||
+  lower.includes('email sign-up isn\'t available')
 ) {
   return compact.slice(0, 500);
 }
